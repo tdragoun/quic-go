@@ -132,12 +132,11 @@ func NewSentPacketHandler(
 ) SentPacketHandler {
 	cc := customCC
 	if cc == nil {
-		cc = congestion.NewCubicSender(
+		cc = congestion.NewCubicCongestionSender(
 			congestion.DefaultClock{},
 			rttStats,
 			connStats,
 			initialMaxDatagramSize,
-			true, // use Reno
 			qlogger,
 		)
 	}
