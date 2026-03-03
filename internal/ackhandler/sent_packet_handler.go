@@ -16,17 +16,34 @@ import (
 )
 
 const (
-	// Maximum reordering in time space before time based loss detection considers a packet lost.
+	// Base (minimum) reordering threshold in time space before time based loss detection considers a packet lost.
 	// Specified as an RTT multiplier.
-	timeThreshold = 9.0 / 8
-	// Maximum reordering in packets before packet threshold loss detection considers a packet lost.
-	packetThreshold = 3
+	baseTimeThreshold = 9.0 / 8 // 1.125
+	// Maximum adaptive time threshold (RTT multiplier).
+	maxTimeThreshold = 4.0
+	// Base (minimum) reordering threshold in packets before packet threshold loss detection considers a packet lost.
+	basePacketThreshold = 3
+	// Maximum adaptive packet threshold.
+	// Increased to 100 to handle extreme reordering scenarios (satellite, cellular with high bufferbloat).
+	// Networks with 50-80 packet reordering are not uncommon on satellite/cellular links.
+	maxPacketThreshold = 100
+	// Smoothing factor for exponential moving average of reordering observations.
+	// Increased to 0.25 for faster adaptation to persistent reordering patterns.
+	// This allows quicker response to high-reordering networks while still filtering transient spikes.
+	reorderingSmoothingFactor = 0.25 // 1/4
+	// Minimum number of spurious losses before adapting thresholds.
+	// Reduced to 1 for immediate adaptation - even a single spurious loss indicates reordering.
+	minSpuriousLossesForAdapt = 1
 	// Before validating the client's address, the server won't send more than 3x bytes than it received.
 	amplificationFactor = 3
 	// We use Retry packets to derive an RTT estimate. Make sure we don't set the RTT to a super low value yet.
 	minRTTAfterRetry = 5 * time.Millisecond
 	// The PTO duration uses exponential backoff, but is truncated to a maximum value, as allowed by RFC 8961, section 4.4.
 	maxPTODuration = 60 * time.Second
+
+	// Legacy constants for compatibility.
+	timeThreshold   = baseTimeThreshold
+	packetThreshold = basePacketThreshold
 )
 
 // Path probe packets are declared lost after this time.
@@ -108,6 +125,13 @@ type sentPacketHandler struct {
 
 	perspective protocol.Perspective
 
+	// Adaptive reordering detection state.
+	spuriousLossCount        int
+	adaptivePacketThreshold  protocol.PacketNumber
+	adaptiveTimeThreshold    float64 // RTT multiplier
+	observedPacketReordering float64 // EMA of packet reordering distance
+	observedTimeReordering   float64 // EMA of time reordering (RTT multiplier)
+
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
@@ -160,6 +184,9 @@ func NewSentPacketHandler(
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
+	// Initialize adaptive thresholds to base values.
+	h.adaptivePacketThreshold = basePacketThreshold
+	h.adaptiveTimeThreshold = baseTimeThreshold
 	return h
 }
 
@@ -523,6 +550,109 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
 	}
+	// Update adaptive thresholds based on observed reordering.
+	if len(spuriousLosses) > 0 {
+		h.updateAdaptiveThresholds(maxPacketReordering, maxTimeReordering)
+	}
+}
+
+// updateAdaptiveThresholds adjusts loss detection thresholds based on observed reordering patterns.
+// It uses exponential moving average (EMA) to smooth observations and prevent over-reaction to transient spikes.
+// For extreme reordering, it uses an aggressive jump-start mechanism to adapt quickly.
+func (h *sentPacketHandler) updateAdaptiveThresholds(packetReordering protocol.PacketNumber, timeReordering time.Duration) {
+	h.spuriousLossCount++
+
+	// Only start adapting after observing minimum spurious losses.
+	if h.spuriousLossCount < minSpuriousLossesForAdapt {
+		return
+	}
+
+	smoothedRTT := h.rttStats.SmoothedRTT()
+	if smoothedRTT == 0 {
+		return // Cannot compute time threshold without RTT estimate
+	}
+
+	oldPacketThreshold := h.adaptivePacketThreshold
+	oldTimeThreshold := h.adaptiveTimeThreshold
+
+	packetReorderingFloat := float64(packetReordering)
+
+	// Detect extreme reordering: if observed reordering is much higher than current EMA,
+	// use aggressive adaptation to jump quickly to the appropriate threshold.
+	isExtremeReordering := h.observedPacketReordering > 0 &&
+		packetReorderingFloat > h.observedPacketReordering*2.0
+
+	// Update packet reordering EMA.
+	if h.observedPacketReordering == 0 {
+		// First observation: initialize directly.
+		h.observedPacketReordering = packetReorderingFloat
+	} else if isExtremeReordering {
+		// Extreme reordering detected: use aggressive smoothing (0.5) to adapt faster.
+		h.observedPacketReordering = 0.5*packetReorderingFloat +
+			0.5*h.observedPacketReordering
+	} else {
+		// Normal EMA: new_value = α × sample + (1-α) × old_value
+		h.observedPacketReordering = reorderingSmoothingFactor*packetReorderingFloat +
+			(1-reorderingSmoothingFactor)*h.observedPacketReordering
+	}
+
+	// Update time reordering EMA (as RTT multiplier).
+	timeReorderingMultiplier := float64(timeReordering) / float64(smoothedRTT)
+	if h.observedTimeReordering == 0 {
+		// First observation: initialize directly.
+		h.observedTimeReordering = timeReorderingMultiplier
+	} else {
+		// EMA: new_value = α × sample + (1-α) × old_value
+		h.observedTimeReordering = reorderingSmoothingFactor*timeReorderingMultiplier +
+			(1-reorderingSmoothingFactor)*h.observedTimeReordering
+	}
+
+	// Calculate new thresholds with adaptive safety margins.
+	// For high reordering scenarios, use larger safety margins (25% instead of +1).
+	var newPacketThreshold protocol.PacketNumber
+	if h.observedPacketReordering > 20 {
+		// High reordering: use 25% safety margin instead of +1.
+		newPacketThreshold = protocol.PacketNumber(h.observedPacketReordering * 1.25)
+	} else {
+		// Normal reordering: use +1 safety margin.
+		newPacketThreshold = protocol.PacketNumber(h.observedPacketReordering) + 1
+	}
+
+	// Bound between base and max.
+	if newPacketThreshold < basePacketThreshold {
+		newPacketThreshold = basePacketThreshold
+	}
+	if newPacketThreshold > maxPacketThreshold {
+		newPacketThreshold = maxPacketThreshold
+	}
+	h.adaptivePacketThreshold = newPacketThreshold
+
+	// Time threshold: observed × 1.25 for safety margin.
+	newTimeThreshold := h.observedTimeReordering * 1.25
+	// Bound between base and max.
+	if newTimeThreshold < baseTimeThreshold {
+		newTimeThreshold = baseTimeThreshold
+	}
+	if newTimeThreshold > maxTimeThreshold {
+		newTimeThreshold = maxTimeThreshold
+	}
+	h.adaptiveTimeThreshold = newTimeThreshold
+
+	// Log threshold changes.
+	if h.logger.Debug() {
+		if oldPacketThreshold != h.adaptivePacketThreshold {
+			mode := ""
+			if isExtremeReordering {
+				mode = " [EXTREME REORDERING - aggressive adaptation]"
+			}
+			h.logger.Debugf("Adaptive packet threshold updated: %d -> %d (observed: %.1f, current sample: %d)%s.",
+				oldPacketThreshold, h.adaptivePacketThreshold, h.observedPacketReordering, packetReordering, mode)
+		}
+		if oldTimeThreshold != h.adaptiveTimeThreshold {
+			h.logger.Debugf("Adaptive time threshold updated: %.2f -> %.2f RTT (observed: %.2f RTT).",
+				oldTimeThreshold, h.adaptiveTimeThreshold, h.observedTimeReordering)
+		}
+	}
 }
 
 // Packets are returned in ascending packet number order.
@@ -791,8 +921,16 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	pnSpace := h.getPacketNumberSpace(encLevel)
 	pnSpace.lossTime = 0
 
+	// Use adaptive thresholds for 1-RTT packets, base thresholds for handshake packets.
+	timeThresholdMultiplier := baseTimeThreshold
+	pktThreshold := protocol.PacketNumber(basePacketThreshold)
+	if encLevel == protocol.Encryption1RTT {
+		timeThresholdMultiplier = h.adaptiveTimeThreshold
+		pktThreshold = h.adaptivePacketThreshold
+	}
+
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
-	lossDelay := time.Duration(timeThreshold * maxRTT)
+	lossDelay := time.Duration(timeThresholdMultiplier * maxRTT)
 
 	// Minimum time of granularity before packets are deemed lost.
 	lossDelay = max(lossDelay, protocol.TimerGranularity)
@@ -823,7 +961,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 					})
 				}
 			}
-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
+		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= pktThreshold {
 			packetLost = true
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				if h.logger.Debug() {
@@ -1122,6 +1260,15 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
+	// Reset adaptive thresholds - new path may have completely different characteristics.
+	h.spuriousLossCount = 0
+	h.adaptivePacketThreshold = basePacketThreshold
+	h.adaptiveTimeThreshold = baseTimeThreshold
+	h.observedPacketReordering = 0
+	h.observedTimeReordering = 0
+	if h.logger.Debug() {
+		h.logger.Debugf("Path migrated - reset adaptive thresholds to base values.")
+	}
 	for pn, p := range h.appDataPackets.history.Packets() {
 		h.appDataPackets.history.DeclareLost(pn)
 		if !p.isPathProbePacket {
