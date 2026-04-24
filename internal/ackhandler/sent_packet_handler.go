@@ -506,6 +506,9 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
 			maxTimeReordering = max(maxTimeReordering, timeReordering)
 
+			// Track spurious loss in connection stats
+			h.connStats.SpuriousLosses.Add(1)
+
 			if h.qlogger != nil {
 				h.qlogger.RecordEvent(qlog.SpuriousLoss{
 					EncryptionLevel:  protocol.Encryption1RTT,

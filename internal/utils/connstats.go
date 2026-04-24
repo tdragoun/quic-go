@@ -11,4 +11,7 @@ type ConnectionStats struct {
 	PacketsReceived atomic.Uint64
 	BytesLost       atomic.Uint64
 	PacketsLost     atomic.Uint64
+	// SpuriousLosses is the number of packets that were declared lost
+	// but later acknowledged (indicating packet reordering)
+	SpuriousLosses atomic.Uint64
 }

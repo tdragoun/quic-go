@@ -825,6 +825,10 @@ type ConnectionStats struct {
 	// (does not monotonically increase, because packets that are declared lost
 	// can subsequently be received).
 	PacketsLost uint64
+	// SpuriousLosses is the number of packets that were declared lost but later
+	// acknowledged, indicating packet reordering. This metric helps quantify
+	// the impact of network reordering on the connection. Monotonically increases.
+	SpuriousLosses uint64
 }
 
 func (c *Conn) ConnectionStats() ConnectionStats {
@@ -840,6 +844,7 @@ func (c *Conn) ConnectionStats() ConnectionStats {
 		PacketsReceived: c.connStats.PacketsReceived.Load(),
 		BytesLost:       c.connStats.BytesLost.Load(),
 		PacketsLost:     c.connStats.PacketsLost.Load(),
+		SpuriousLosses:  c.connStats.SpuriousLosses.Load(),
 	}
 }
 
